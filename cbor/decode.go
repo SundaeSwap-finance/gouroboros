@@ -36,7 +36,7 @@ var (
 	cachedStrictDecModeOnce sync.Once
 )
 
-const cborMaxNestedLevels = 256
+const cborMaxNestedLevels = 65535
 
 // getDecMode returns a cached DecMode, initializing it on first use.
 // Uses sync.Once for thread-safe lazy initialization.
