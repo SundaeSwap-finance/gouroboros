@@ -273,6 +273,28 @@ type ConwayBlockHeader struct {
 	babbage.BabbageBlockHeader
 }
 
+// UnmarshalCBOR decodes a Conway block header. The Leios prototype (Musashi)
+// appends block_body_contains_leios_cert and eb_announcement to the header
+// body of Conway era headers too. A Conway block carries no Leios
+// certificate, so those two fields are accepted and dropped, while the
+// original header body CBOR is kept for signature verification.
+func (h *ConwayBlockHeader) UnmarshalCBOR(cborData []byte) error {
+	extra, err := babbage.DecodeBlockHeaderWithExtraFields(
+		cborData,
+		&h.BabbageBlockHeader,
+	)
+	if err != nil {
+		return err
+	}
+	if len(extra) != 0 && len(extra) != 2 {
+		return fmt.Errorf(
+			"invalid Conway block header body: expected 10 or 12 fields, got %d",
+			10+len(extra),
+		)
+	}
+	return nil
+}
+
 func (h *ConwayBlockHeader) Era() common.Era {
 	return EraConway
 }

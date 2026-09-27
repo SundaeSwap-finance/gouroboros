@@ -326,6 +326,57 @@ func (h *BabbageBlockHeader) UnmarshalCBOR(cborData []byte) error {
 	return nil
 }
 
+// DecodeBlockHeaderWithExtraFields decodes a block header whose header body
+// may carry fields after Babbage's ten, as the Leios prototype (Musashi)
+// writes for Conway and Dijkstra headers:
+//
+//	header_body = [..., protocol_version, block_body_contains_leios_cert, eb_announcement / nil]
+//
+// The ten Babbage fields are decoded into h, which keeps the original header
+// and header body CBOR, and any trailing header body fields are returned raw.
+func DecodeBlockHeaderWithExtraFields(
+	cborData []byte,
+	h *BabbageBlockHeader,
+) ([]cbor.RawMessage, error) {
+	var parts []cbor.RawMessage
+	if _, err := cbor.Decode(cborData, &parts); err != nil {
+		return nil, err
+	}
+	if len(parts) != 2 {
+		return nil, fmt.Errorf(
+			"invalid block header: expected 2 components, got %d",
+			len(parts),
+		)
+	}
+	var bodyItems []cbor.RawMessage
+	if _, err := cbor.Decode(parts[0], &bodyItems); err != nil {
+		return nil, fmt.Errorf("decode block header body: %w", err)
+	}
+	if len(bodyItems) <= 10 {
+		var tmp BabbageBlockHeader
+		if _, err := cbor.Decode(cborData, &tmp); err != nil {
+			return nil, err
+		}
+		*h = tmp
+		return nil, nil
+	}
+	babbageBody, err := cbor.Encode(bodyItems[:10])
+	if err != nil {
+		return nil, err
+	}
+	var tmp BabbageBlockHeader
+	if _, err := cbor.Decode(babbageBody, &tmp.Body); err != nil {
+		return nil, fmt.Errorf("decode block header body: %w", err)
+	}
+	tmp.Body.SetCbor(parts[0])
+	if _, err := cbor.Decode(parts[1], &tmp.Signature); err != nil {
+		return nil, fmt.Errorf("decode block header signature: %w", err)
+	}
+	tmp.SetCbor(cborData)
+	*h = tmp
+	return bodyItems[10:], nil
+}
+
 func (h *BabbageBlockHeader) Hash() common.Blake2b256 {
 	if h.hash == nil {
 		tmpHash := common.Blake2b256Hash(h.Cbor())

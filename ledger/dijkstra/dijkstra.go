@@ -72,14 +72,22 @@ type DijkstraBlock struct {
 	BlockBody   DijkstraBlockBody
 }
 
+// UnmarshalCBOR decodes either block layout:
+//
+//   - the Leios prototype (Musashi) layout, block = [header, block_body]
+//     with block_body = [transactions, leios_certificate / nil,
+//     peras_certificate / nil] and complete inline transactions;
+//   - the generated Dijkstra CDDL layout, block = [header, transaction_bodies,
+//     transaction_witness_sets, auxiliary_data_set, invalid_transactions,
+//     leios_cert / nil, peras_cert / nil].
 func (b *DijkstraBlock) UnmarshalCBOR(cborData []byte) error {
 	var items []cbor.RawMessage
 	if _, err := cbor.Decode(cborData, &items); err != nil {
 		return err
 	}
-	if len(items) != 7 {
+	if len(items) != 2 && len(items) != 7 {
 		return fmt.Errorf(
-			"invalid Dijkstra block: expected 7 components, got %d",
+			"invalid Dijkstra block: expected 2 or 7 components, got %d",
 			len(items),
 		)
 	}
@@ -88,7 +96,11 @@ func (b *DijkstraBlock) UnmarshalCBOR(cborData []byte) error {
 		return fmt.Errorf("decode Dijkstra block header: %w", err)
 	}
 	var body DijkstraBlockBody
-	if err := body.decodeComponents(items[1:]); err != nil {
+	if len(items) == 2 {
+		if _, err := cbor.Decode(items[1], &body); err != nil {
+			return fmt.Errorf("decode Dijkstra block body: %w", err)
+		}
+	} else if err := body.decodeComponents(items[1:]); err != nil {
 		return err
 	}
 	b.BlockHeader = &header
@@ -100,6 +112,9 @@ func (b *DijkstraBlock) UnmarshalCBOR(cborData []byte) error {
 func (b *DijkstraBlock) MarshalCBOR() ([]byte, error) {
 	if b.Cbor() != nil {
 		return b.Cbor(), nil
+	}
+	if b.BlockBody.inlineTransactions {
+		return cbor.Encode([]any{b.BlockHeader, b.BlockBody})
 	}
 	components, err := b.BlockBody.componentCbors()
 	if err != nil {
@@ -192,71 +207,101 @@ func (b *DijkstraBlock) CalculatedBlockBodyHash() common.Blake2b256 {
 	return b.BlockBody.Hash()
 }
 
-// DijkstraLeiosCertificate matches the generated Dijkstra CDDL in
-// IntersectMBO/cardano-ledger at c47305fcf47bd77437b837d0dfb9cb4181bfbc77:
+// DijkstraLeiosCertificate is the nullable Leios certificate slot of a
+// Dijkstra block body. Two encodings are accepted:
 //
-//	block = [..., leios_cert : leios_cert / nil, peras_cert : peras_cert / nil]
-//	leios_cert = []
-//	peras_cert = []
-//
-// The Leios and Peras slots are always present and nullable. When non-null,
-// the current Dijkstra CDDL placeholder is an empty CBOR list, not the CIP-0164
-// stake-committee EB certificate payload.
+//   - the Leios prototype (Musashi) certificate,
+//     leios_certificate = [signers : bytes, signature : bytes .size 48],
+//     where signers is a bitfield naming the committee members that voted;
+//   - the empty list placeholder of the generated Dijkstra CDDL in
+//     IntersectMBO/cardano-ledger at c47305fcf47bd77437b837d0dfb9cb4181bfbc77,
+//     leios_cert = [], which leaves Signers and Signature nil.
 type DijkstraLeiosCertificate struct {
 	cbor.DecodeStoreCbor
+	Signers   []byte
+	Signature []byte
 }
 
 func (c *DijkstraLeiosCertificate) UnmarshalCBOR(cborData []byte) error {
-	return decodeDijkstraEmptyCertificate(
-		cborData,
-		"Dijkstra Leios certificate",
-		&c.DecodeStoreCbor,
-	)
-}
-
-func (c DijkstraLeiosCertificate) MarshalCBOR() ([]byte, error) {
-	return marshalDijkstraEmptyCertificate(c.DecodeStoreCbor)
-}
-
-type DijkstraPerasCertificate struct {
-	cbor.DecodeStoreCbor
-}
-
-func (c *DijkstraPerasCertificate) UnmarshalCBOR(cborData []byte) error {
-	return decodeDijkstraEmptyCertificate(
-		cborData,
-		"Dijkstra Peras certificate",
-		&c.DecodeStoreCbor,
-	)
-}
-
-func (c DijkstraPerasCertificate) MarshalCBOR() ([]byte, error) {
-	return marshalDijkstraEmptyCertificate(c.DecodeStoreCbor)
-}
-
-func decodeDijkstraEmptyCertificate(
-	cborData []byte,
-	name string,
-	store *cbor.DecodeStoreCbor,
-) error {
 	var items []cbor.RawMessage
 	if _, err := cbor.Decode(cborData, &items); err != nil {
 		return err
 	}
-	if len(items) != 0 {
-		return fmt.Errorf("%s must be an empty list", name)
+	var tmp DijkstraLeiosCertificate
+	switch len(items) {
+	case 0:
+	case 2:
+		if _, err := cbor.Decode(items[0], &tmp.Signers); err != nil {
+			return fmt.Errorf("decode Dijkstra Leios certificate signers: %w", err)
+		}
+		if _, err := cbor.Decode(items[1], &tmp.Signature); err != nil {
+			return fmt.Errorf("decode Dijkstra Leios certificate signature: %w", err)
+		}
+	default:
+		return fmt.Errorf(
+			"invalid Dijkstra Leios certificate: expected an empty list or [signers, signature], got %d items",
+			len(items),
+		)
 	}
-	store.SetCbor(cborData)
+	*c = tmp
+	c.SetCbor(cborData)
 	return nil
 }
 
-func marshalDijkstraEmptyCertificate(
-	store cbor.DecodeStoreCbor,
-) ([]byte, error) {
-	if raw := store.Cbor(); len(raw) > 0 {
+func (c DijkstraLeiosCertificate) MarshalCBOR() ([]byte, error) {
+	if raw := c.Cbor(); len(raw) > 0 {
 		return raw, nil
 	}
-	return cbor.Encode([]any{})
+	if c.Signers == nil && c.Signature == nil {
+		return cbor.Encode([]any{})
+	}
+	return cbor.Encode([]any{c.Signers, c.Signature})
+}
+
+// DijkstraPerasCertificate is the nullable Peras certificate slot of a
+// Dijkstra block body. The Leios prototype (Musashi) CDDL defines it as
+// opaque bytes (peras_certificate = bytes), and the generated Dijkstra CDDL
+// as an empty list placeholder. Both are accepted. Data holds the byte string
+// content and is nil for the placeholder.
+type DijkstraPerasCertificate struct {
+	cbor.DecodeStoreCbor
+	Data []byte
+}
+
+func (c *DijkstraPerasCertificate) UnmarshalCBOR(cborData []byte) error {
+	if len(cborData) == 0 {
+		return errors.New("empty Dijkstra Peras certificate")
+	}
+	var tmp DijkstraPerasCertificate
+	switch cborData[0] & cbor.CborTypeMask {
+	case cbor.CborTypeByteString:
+		if _, err := cbor.Decode(cborData, &tmp.Data); err != nil {
+			return fmt.Errorf("decode Dijkstra Peras certificate: %w", err)
+		}
+	default:
+		var items []cbor.RawMessage
+		if _, err := cbor.Decode(cborData, &items); err != nil {
+			return err
+		}
+		if len(items) != 0 {
+			return errors.New(
+				"dijkstra Peras certificate must be bytes or an empty list",
+			)
+		}
+	}
+	*c = tmp
+	c.SetCbor(cborData)
+	return nil
+}
+
+func (c DijkstraPerasCertificate) MarshalCBOR() ([]byte, error) {
+	if raw := c.Cbor(); len(raw) > 0 {
+		return raw, nil
+	}
+	if c.Data == nil {
+		return cbor.Encode([]any{})
+	}
+	return cbor.Encode(c.Data)
 }
 
 type DijkstraBlockBody struct {
@@ -274,6 +319,14 @@ type DijkstraBlockBody struct {
 	invalidTxsCbor         []byte
 	leiosCertificateCbor   []byte
 	perasCertificateCbor   []byte
+	// inlineTransactions is set for the Leios prototype (Musashi) layout,
+	// block_body = [transactions, leios_certificate / nil,
+	// peras_certificate / nil], where each transaction is the complete
+	// [transaction_body, transaction_witness_set, auxiliary_data / nil,
+	// is_valid] array. Only Transactions, InvalidTransactions and the
+	// certificates are populated for this layout.
+	inlineTransactions     bool
+	indefiniteTransactions bool
 }
 
 func (b *DijkstraBlockBody) UnmarshalCBOR(cborData []byte) error {
@@ -281,22 +334,120 @@ func (b *DijkstraBlockBody) UnmarshalCBOR(cborData []byte) error {
 	if _, err := cbor.Decode(cborData, &items); err != nil {
 		return err
 	}
-	if len(items) != 6 {
+	switch len(items) {
+	case 3:
+		if err := b.decodeInlineComponents(items); err != nil {
+			return err
+		}
+	case 6:
+		if err := b.decodeComponents(items); err != nil {
+			return err
+		}
+	default:
 		return fmt.Errorf(
-			"invalid Dijkstra block body: expected 6 components, got %d",
+			"invalid Dijkstra block body: expected 3 or 6 components, got %d",
 			len(items),
 		)
-	}
-	if err := b.decodeComponents(items); err != nil {
-		return err
 	}
 	b.SetCborReference(cborData)
 	return nil
 }
 
+// decodeInlineComponents decodes the Leios prototype (Musashi) block body.
+//
+// A ranking block that certifies an endorser block carries no transactions
+// of its own on the wire. Node-to-client chain sync (and so Dolos) serves it
+// resolved instead: the certified endorser block's transactions are inlined
+// into the transactions list. Such a body no longer hashes to the header's
+// block_body_hash, so callers decoding resolved blocks must skip body hash
+// validation.
+func (b *DijkstraBlockBody) decodeInlineComponents(
+	items []cbor.RawMessage,
+) error {
+	var rawTxs []cbor.RawMessage
+	if _, err := cbor.Decode(items[0], &rawTxs); err != nil {
+		return fmt.Errorf("decode Dijkstra block transactions: %w", err)
+	}
+	txs := make([]DijkstraTransaction, len(rawTxs))
+	var invalidTxs []uint
+	for idx, rawTx := range rawTxs {
+		var txArray []cbor.RawMessage
+		if _, err := cbor.Decode(rawTx, &txArray); err != nil {
+			return fmt.Errorf("decode Dijkstra block transaction %d: %w", idx, err)
+		}
+		if len(txArray) != 4 || !isCborBool(txArray[3]) {
+			return fmt.Errorf(
+				"invalid Dijkstra block transaction %d: expected [body, witness_set, auxiliary_data / nil, is_valid]",
+				idx,
+			)
+		}
+		tx, err := newDijkstraTransactionFromCborComponents(rawTx, txArray, true)
+		if err != nil {
+			return fmt.Errorf("decode Dijkstra block transaction %d: %w", idx, err)
+		}
+		if !tx.TxIsValid {
+			invalidTxs = append(invalidTxs, uint(idx)) // #nosec G115
+		}
+		txs[idx] = *tx
+	}
+	leiosCert, err := decodeDijkstraLeiosCertificate(items[1])
+	if err != nil {
+		return err
+	}
+	perasCert, err := decodeDijkstraPerasCertificate(items[2])
+	if err != nil {
+		return err
+	}
+	*b = DijkstraBlockBody{
+		Transactions:        txs,
+		InvalidTransactions: invalidTxs,
+		LeiosCertificate:    leiosCert,
+		PerasCertificate:    perasCert,
+		inlineTransactions:  true,
+		// Block producers may write the list with indefinite length.
+		indefiniteTransactions: len(items[0]) > 0 && items[0][0] == 0x9f,
+	}
+	return nil
+}
+
+func (b DijkstraBlockBody) encodeInline() ([]byte, error) {
+	txs := make([]cbor.RawMessage, len(b.Transactions))
+	for idx := range b.Transactions {
+		raw, err := b.Transactions[idx].blockTransactionCbor()
+		if err != nil {
+			return nil, fmt.Errorf("encode Dijkstra block transaction %d: %w", idx, err)
+		}
+		txs[idx] = raw
+	}
+	var txsCbor []byte
+	if b.indefiniteTransactions {
+		txsCbor = []byte{0x9f}
+		for _, raw := range txs {
+			txsCbor = append(txsCbor, raw...)
+		}
+		txsCbor = append(txsCbor, 0xff)
+	} else {
+		var err error
+		if txsCbor, err = cbor.Encode(txs); err != nil {
+			return nil, err
+		}
+	}
+	var leiosCert, perasCert any
+	if b.LeiosCertificate != nil {
+		leiosCert = b.LeiosCertificate
+	}
+	if b.PerasCertificate != nil {
+		perasCert = b.PerasCertificate
+	}
+	return cbor.Encode([]any{cbor.RawMessage(txsCbor), leiosCert, perasCert})
+}
+
 func (b DijkstraBlockBody) MarshalCBOR() ([]byte, error) {
 	if b.Cbor() != nil {
 		return b.Cbor(), nil
+	}
+	if b.inlineTransactions {
+		return b.encodeInline()
 	}
 	components, err := b.componentCbors()
 	if err != nil {
@@ -309,7 +460,17 @@ func (b DijkstraBlockBody) MarshalCBOR() ([]byte, error) {
 	return cbor.Encode(items)
 }
 
+// Hash returns the block body hash. In the Leios prototype (Musashi) layout
+// it is the blake2b-256 of the body CBOR, and in the generated Dijkstra CDDL
+// layout the hash of the concatenated component hashes.
 func (b DijkstraBlockBody) Hash() common.Blake2b256 {
+	if b.inlineTransactions {
+		raw, err := b.MarshalCBOR()
+		if err != nil {
+			panic("CBOR encoding that should never fail has failed: " + err.Error())
+		}
+		return common.Blake2b256Hash(raw)
+	}
 	components, err := b.componentCbors()
 	if err != nil {
 		panic("CBOR encoding that should never fail has failed: " + err.Error())
@@ -613,18 +774,102 @@ func decodeDijkstraPerasCertificate(
 	return &cert, nil
 }
 
+// DijkstraEbAnnouncement is the endorser block a ranking block header
+// announces:
+//
+//	eb_announcement = [eb_hash : hash32, eb_size : uint .size 4]
+type DijkstraEbAnnouncement struct {
+	cbor.StructAsArray
+	EbHash common.Blake2b256
+	EbSize uint32
+}
+
+// DijkstraBlockHeader is a Dijkstra ranking block header. The header body is
+// Babbage's ten fields followed, in the Leios prototype (Musashi) layout, by
+//
+//	block_body_contains_leios_cert : bool,
+//	eb_announcement : eb_announcement / nil
+//
+// Both the ten and twelve field header bodies are accepted. The trailing
+// fields are exposed on the header, and Body.Cbor() holds the original header
+// body bytes either way.
 type DijkstraBlockHeader struct {
 	babbage.BabbageBlockHeader
+	BlockBodyContainsLeiosCert bool
+	EbAnnouncement             *DijkstraEbAnnouncement
 }
 
 func (h *DijkstraBlockHeader) UnmarshalCBOR(cborData []byte) error {
-	var tmp babbage.BabbageBlockHeader
-	if _, err := cbor.Decode(cborData, &tmp); err != nil {
+	var tmp DijkstraBlockHeader
+	extra, err := babbage.DecodeBlockHeaderWithExtraFields(
+		cborData,
+		&tmp.BabbageBlockHeader,
+	)
+	if err != nil {
 		return err
 	}
-	h.BabbageBlockHeader = tmp
-	h.SetCbor(cborData)
+	switch len(extra) {
+	case 0:
+	case 2:
+		if _, err := cbor.Decode(extra[0], &tmp.BlockBodyContainsLeiosCert); err != nil {
+			return fmt.Errorf(
+				"decode Dijkstra block_body_contains_leios_cert: %w",
+				err,
+			)
+		}
+		if !isCborNull(extra[1]) {
+			tmp.EbAnnouncement = new(DijkstraEbAnnouncement)
+			if _, err := cbor.Decode(extra[1], tmp.EbAnnouncement); err != nil {
+				return fmt.Errorf("decode Dijkstra eb_announcement: %w", err)
+			}
+		}
+	default:
+		return fmt.Errorf(
+			"invalid Dijkstra block header body: expected 10 or 12 fields, got %d",
+			10+len(extra),
+		)
+	}
+	*h = tmp
 	return nil
+}
+
+func (h *DijkstraBlockHeader) MarshalCBOR() ([]byte, error) {
+	if raw := h.Cbor(); len(raw) > 0 {
+		return raw, nil
+	}
+	body, err := h.HeaderBodyCbor()
+	if err != nil {
+		return nil, err
+	}
+	return cbor.Encode([]any{cbor.RawMessage(body), h.Signature})
+}
+
+// HeaderBodyCbor returns the CBOR of the header body, the bytes the KES
+// signature covers. It is the original encoding when the header was decoded.
+// A constructed header encodes the twelve field Leios layout.
+func (h *DijkstraBlockHeader) HeaderBodyCbor() ([]byte, error) {
+	if raw := h.Body.Cbor(); len(raw) > 0 {
+		return raw, nil
+	}
+	b := h.Body
+	var eb any
+	if h.EbAnnouncement != nil {
+		eb = h.EbAnnouncement
+	}
+	return cbor.Encode([]any{
+		b.BlockNumber,
+		b.Slot,
+		b.PrevHash,
+		b.IssuerVkey,
+		b.VrfKey,
+		b.VrfResult,
+		b.BlockBodySize,
+		b.BlockBodyHash,
+		b.OpCert,
+		b.ProtoVersion,
+		h.BlockBodyContainsLeiosCert,
+		eb,
+	})
 }
 
 func (h *DijkstraBlockHeader) Era() common.Era {
@@ -750,6 +995,71 @@ func (g DijkstraGuards) MarshalCBOR() ([]byte, error) {
 	return cbor.Encode(cbor.NewSetType(g.KeyHashes, true))
 }
 
+// DijkstraBlsKey is the optional pool_params BLS key of the Leios prototype:
+//
+//	bls_key = [bls_pubkey : bytes .size 96, bls_possession_proof : bytes .size 48]
+type DijkstraBlsKey struct {
+	cbor.StructAsArray
+	PublicKey       []byte
+	PossessionProof []byte
+}
+
+// DijkstraCertificateWrapper decodes a Dijkstra certificate. It matches
+// common.CertificateWrapper except that pool_params may carry an optional
+// bls_key (bls_key / nil) after the VRF key hash. That field is exposed as
+// PoolBlsKey, and the certificate itself decodes to the usual
+// *common.PoolRegistrationCertificate with its original CBOR retained.
+type DijkstraCertificateWrapper struct {
+	common.CertificateWrapper
+	PoolBlsKey *DijkstraBlsKey
+}
+
+func (c *DijkstraCertificateWrapper) UnmarshalCBOR(data []byte) error {
+	certType, err := cbor.DecodeIdFromList(data)
+	if err != nil {
+		return err
+	}
+	if certType != int(common.CertificateTypePoolRegistration) {
+		c.PoolBlsKey = nil
+		return c.CertificateWrapper.UnmarshalCBOR(data)
+	}
+	var items []cbor.RawMessage
+	if _, err := cbor.Decode(data, &items); err != nil {
+		return err
+	}
+	var blsKey *DijkstraBlsKey
+	certData := data
+	if len(items) == 11 {
+		if !isCborNull(items[3]) {
+			blsKey = new(DijkstraBlsKey)
+			if _, err := cbor.Decode(items[3], blsKey); err != nil {
+				return fmt.Errorf("decode pool registration bls_key: %w", err)
+			}
+		}
+		items = slices.Delete(items, 3, 4)
+		if certData, err = cbor.Encode(items); err != nil {
+			return err
+		}
+	}
+	if err := c.CertificateWrapper.UnmarshalCBOR(certData); err != nil {
+		return err
+	}
+	if cert, ok := c.Certificate.(*common.PoolRegistrationCertificate); ok {
+		cert.SetCbor(data)
+	}
+	c.PoolBlsKey = blsKey
+	return nil
+}
+
+func (c *DijkstraCertificateWrapper) MarshalCBOR() ([]byte, error) {
+	if c.Certificate != nil {
+		if raw := c.Certificate.Cbor(); len(raw) > 0 {
+			return raw, nil
+		}
+	}
+	return c.CertificateWrapper.MarshalCBOR()
+}
+
 type DijkstraRawCbor struct {
 	cbor.DecodeStoreCbor
 }
@@ -768,29 +1078,31 @@ func (r DijkstraRawCbor) MarshalCBOR() ([]byte, error) {
 
 type DijkstraTransactionBody struct {
 	common.TransactionBodyBase
-	TxInputs                conway.ConwayTransactionInputSet              `cbor:"0,keyasint,omitempty"`
-	TxOutputs               []DijkstraTransactionOutput                   `cbor:"1,keyasint,omitempty"`
-	TxFee                   uint64                                        `cbor:"2,keyasint,omitempty"`
-	Ttl                     uint64                                        `cbor:"3,keyasint,omitempty"`
-	TxCertificates          []common.CertificateWrapper                   `cbor:"4,keyasint,omitempty"`
-	TxWithdrawals           map[*common.Address]uint64                    `cbor:"5,keyasint,omitempty"`
-	TxAuxDataHash           *common.Blake2b256                            `cbor:"7,keyasint,omitempty"`
-	TxValidityIntervalStart uint64                                        `cbor:"8,keyasint,omitempty"`
-	TxMint                  *common.MultiAsset[common.MultiAssetTypeMint] `cbor:"9,keyasint,omitempty"`
-	TxScriptDataHash        *common.Blake2b256                            `cbor:"11,keyasint,omitempty"`
-	TxCollateral            cbor.SetType[shelley.ShelleyTransactionInput] `cbor:"13,keyasint,omitempty,omitzero"`
-	TxGuards                *DijkstraGuards                               `cbor:"14,keyasint,omitempty"`
-	TxNetworkId             *uint8                                        `cbor:"15,keyasint,omitempty"`
-	TxCollateralReturn      *DijkstraTransactionOutput                    `cbor:"16,keyasint,omitempty"`
-	TxTotalCollateral       uint64                                        `cbor:"17,keyasint,omitempty"`
-	TxReferenceInputs       cbor.SetType[shelley.ShelleyTransactionInput] `cbor:"18,keyasint,omitempty,omitzero"`
-	TxVotingProcedures      common.VotingProcedures                       `cbor:"19,keyasint,omitempty"`
-	TxProposalProcedures    []DijkstraProposalProcedure                   `cbor:"20,keyasint,omitempty"`
-	TxCurrentTreasuryValue  uint64                                        `cbor:"21,keyasint,omitempty"`
-	TxDonation              uint64                                        `cbor:"22,keyasint,omitempty"`
-	TxSubTransactions       cbor.SetType[DijkstraSubTransaction]          `cbor:"23,keyasint,omitempty,omitzero"`
-	TxDirectDeposits        map[cbor.ByteString]uint64                    `cbor:"25,keyasint,omitempty"`
-	TxBalanceIntervals      *DijkstraRawCbor                              `cbor:"26,keyasint,omitempty"`
+	TxInputs                   conway.ConwayTransactionInputSet              `cbor:"0,keyasint,omitempty"`
+	TxOutputs                  []DijkstraTransactionOutput                   `cbor:"1,keyasint,omitempty"`
+	TxFee                      uint64                                        `cbor:"2,keyasint,omitempty"`
+	Ttl                        uint64                                        `cbor:"3,keyasint,omitempty"`
+	TxCertificates             []DijkstraCertificateWrapper                  `cbor:"4,keyasint,omitempty"`
+	TxWithdrawals              map[*common.Address]uint64                    `cbor:"5,keyasint,omitempty"`
+	TxAuxDataHash              *common.Blake2b256                            `cbor:"7,keyasint,omitempty"`
+	TxValidityIntervalStart    uint64                                        `cbor:"8,keyasint,omitempty"`
+	TxMint                     *common.MultiAsset[common.MultiAssetTypeMint] `cbor:"9,keyasint,omitempty"`
+	TxScriptDataHash           *common.Blake2b256                            `cbor:"11,keyasint,omitempty"`
+	TxCollateral               cbor.SetType[shelley.ShelleyTransactionInput] `cbor:"13,keyasint,omitempty,omitzero"`
+	TxGuards                   *DijkstraGuards                               `cbor:"14,keyasint,omitempty"`
+	TxNetworkId                *uint8                                        `cbor:"15,keyasint,omitempty"`
+	TxCollateralReturn         *DijkstraTransactionOutput                    `cbor:"16,keyasint,omitempty"`
+	TxTotalCollateral          uint64                                        `cbor:"17,keyasint,omitempty"`
+	TxReferenceInputs          cbor.SetType[shelley.ShelleyTransactionInput] `cbor:"18,keyasint,omitempty,omitzero"`
+	TxVotingProcedures         common.VotingProcedures                       `cbor:"19,keyasint,omitempty"`
+	TxProposalProcedures       []DijkstraProposalProcedure                   `cbor:"20,keyasint,omitempty"`
+	TxCurrentTreasuryValue     uint64                                        `cbor:"21,keyasint,omitempty"`
+	TxDonation                 uint64                                        `cbor:"22,keyasint,omitempty"`
+	TxSubTransactions          cbor.SetType[DijkstraSubTransaction]          `cbor:"23,keyasint,omitempty,omitzero"`
+	TxRequiredTopLevelGuards   *DijkstraRawCbor                              `cbor:"24,keyasint,omitempty"`
+	TxDirectDeposits           map[cbor.ByteString]uint64                    `cbor:"25,keyasint,omitempty"`
+	TxBalanceIntervals         *DijkstraRawCbor                              `cbor:"26,keyasint,omitempty"`
+	TxStartingBalanceIntervals *DijkstraRawCbor                              `cbor:"27,keyasint,omitempty"`
 }
 
 func (b *DijkstraTransactionBody) UnmarshalCBOR(cborData []byte) error {
@@ -918,7 +1230,7 @@ func dijkstraTransactionOutputs(
 }
 
 func dijkstraCertificates(
-	certificates []common.CertificateWrapper,
+	certificates []DijkstraCertificateWrapper,
 ) []common.Certificate {
 	ret := make([]common.Certificate, len(certificates))
 	for i, cert := range certificates {
@@ -980,7 +1292,7 @@ type DijkstraSubTransactionBody struct {
 	TxInputs                  conway.ConwayTransactionInputSet              `cbor:"0,keyasint,omitempty"`
 	TxOutputs                 []DijkstraTransactionOutput                   `cbor:"1,keyasint,omitempty"`
 	Ttl                       uint64                                        `cbor:"3,keyasint,omitempty"`
-	TxCertificates            []common.CertificateWrapper                   `cbor:"4,keyasint,omitempty"`
+	TxCertificates            []DijkstraCertificateWrapper                  `cbor:"4,keyasint,omitempty"`
 	TxWithdrawals             map[*common.Address]uint64                    `cbor:"5,keyasint,omitempty"`
 	TxAuxDataHash             *common.Blake2b256                            `cbor:"7,keyasint,omitempty"`
 	TxValidityIntervalStart   uint64                                        `cbor:"8,keyasint,omitempty"`
@@ -1087,7 +1399,7 @@ func (r *DijkstraRedeemers) UnmarshalCBOR(cborData []byte) error {
 		return errors.New("dijkstra redeemers must use map encoding")
 	}
 	var redeemers map[common.RedeemerKey]common.RedeemerValue
-	if err := cbor.DecodeGeneric(cborData, &redeemers); err != nil {
+	if _, err := cbor.Decode(cborData, &redeemers); err != nil {
 		return err
 	}
 	if len(redeemers) == 0 {
@@ -1395,6 +1707,25 @@ func (t *DijkstraTransaction) MarshalCBOR() ([]byte, error) {
 	return cbor.Encode([]any{t.Body, t.WitnessSet, aux})
 }
 
+// blockTransactionCbor returns the transaction in the Leios prototype
+// (Musashi) block form, [body, witness_set, auxiliary_data / nil, is_valid].
+func (t *DijkstraTransaction) blockTransactionCbor() ([]byte, error) {
+	if raw := t.DecodeStoreCbor.Cbor(); raw != nil {
+		var txArray []cbor.RawMessage
+		if _, err := cbor.Decode(raw, &txArray); err == nil &&
+			len(txArray) == 4 && isCborBool(txArray[3]) {
+			return raw, nil
+		}
+	}
+	var aux any
+	if t.auxData != nil && len(t.auxData.Cbor()) > 0 {
+		aux = cbor.RawMessage(t.auxData.Cbor())
+	} else if t.TxMetadata != nil {
+		aux = cbor.RawMessage(t.TxMetadata.Cbor())
+	}
+	return cbor.Encode([]any{t.Body, t.WitnessSet, aux, t.TxIsValid})
+}
+
 func (t *DijkstraTransaction) Cbor() []byte {
 	if cborData := t.DecodeStoreCbor.Cbor(); cborData != nil {
 		return cborData[:]
@@ -1586,7 +1917,15 @@ func newDijkstraTransactionFromCborComponents(
 		return nil, fmt.Errorf("failed to decode transaction witness set: %w", err)
 	}
 	auxIdx := 2
-	if len(txArray) == 4 {
+	ret.TxIsValid = true
+	switch {
+	case len(txArray) == 4 && isCborBool(txArray[3]):
+		// Leios prototype (Musashi) block_transaction:
+		// [transaction_body, transaction_witness_set, auxiliary_data / nil, is_valid]
+		if _, err := cbor.Decode(txArray[3], &ret.TxIsValid); err != nil {
+			return nil, fmt.Errorf("failed to decode TxIsValid: %w", err)
+		}
+	case len(txArray) == 4:
 		var txIsValid bool
 		if _, err := cbor.Decode(txArray[2], &txIsValid); err != nil {
 			return nil, fmt.Errorf("failed to decode TxIsValid: %w", err)
@@ -1596,7 +1935,6 @@ func newDijkstraTransactionFromCborComponents(
 		}
 		auxIdx = 3
 	}
-	ret.TxIsValid = true
 	if err := decodeAuxiliaryDataInto(
 		txArray[auxIdx],
 		&ret.TxMetadata,
@@ -1648,4 +1986,8 @@ func decodeAuxiliaryDataInto(
 
 func isCborNull(raw cbor.RawMessage) bool {
 	return len(raw) == 1 && raw[0] == 0xf6
+}
+
+func isCborBool(raw cbor.RawMessage) bool {
+	return len(raw) == 1 && (raw[0] == 0xf4 || raw[0] == 0xf5)
 }
