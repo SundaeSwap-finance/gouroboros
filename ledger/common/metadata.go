@@ -93,7 +93,31 @@ func (m MetaText) TypeName() string  { return "text" }
 func (m MetaList) TypeName() string  { return "list" }
 func (m MetaMap) TypeName() string   { return "map" }
 
+// MaxMetadatumDepth bounds how deeply nested a transaction metadatum may be
+// before DecodeMetadatumRaw refuses to interpret it. The CBOR layer accepts
+// nesting up to cborMaxNestedLevels so a block the node accepted always
+// decodes, but interpreting a metadatum re-validates every subtree at every
+// level, so the cost of a nested list grows with the square of its depth: a
+// 16 KB chain of single-element lists (preview block 4,821,137, slot
+// 127,055,999) took 21 s and 450 MB and stalled every sync consumer for
+// three days. Real metadata (CIP-20, CIP-25, CIP-68) nests fewer than ten
+// levels; 256 leaves wide room and caps the work at 256 passes over the
+// metadatum's bytes.
+const MaxMetadatumDepth = 256
+
+// ErrMetadatumTooDeep is returned when a metadatum nests deeper than
+// MaxMetadatumDepth. Callers that only need the raw bytes should keep them
+// and treat the parsed form as absent.
+var ErrMetadatumTooDeep = errors.New("metadatum nests deeper than MaxMetadatumDepth")
+
 func DecodeMetadatumRaw(b []byte) (TransactionMetadatum, error) {
+	return decodeMetadatumRaw(b, 0)
+}
+
+func decodeMetadatumRaw(b []byte, depth int) (TransactionMetadatum, error) {
+	if depth > MaxMetadatumDepth {
+		return nil, ErrMetadatumTooDeep
+	}
 	if len(b) == 0 {
 		return nil, errors.New("empty cbor")
 	}
@@ -132,7 +156,7 @@ func DecodeMetadatumRaw(b []byte) (TransactionMetadatum, error) {
 		}
 		items := make([]TransactionMetadatum, 0, len(rawItems))
 		for _, r := range rawItems {
-			md, err := DecodeMetadatumRaw(r)
+			md, err := decodeMetadatumRaw(r, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -148,72 +172,72 @@ func DecodeMetadatumRaw(b []byte) (TransactionMetadatum, error) {
 			if md, ok := decodeMapTextText(b); ok {
 				return md, nil
 			}
-			if md, ok, err := decodeMapText(b); ok || err != nil {
+			if md, ok, err := decodeMapText(b, depth); ok || err != nil {
 				return md, err
 			}
-			if md, ok, err := decodeMapUint(b); ok || err != nil {
+			if md, ok, err := decodeMapUint(b, depth); ok || err != nil {
 				return md, err
 			}
-			if md, ok, err := decodeMapInt(b); ok || err != nil {
+			if md, ok, err := decodeMapInt(b, depth); ok || err != nil {
 				return md, err
 			}
-			if md, ok, err := decodeMapBytes(b); ok || err != nil {
+			if md, ok, err := decodeMapBytes(b, depth); ok || err != nil {
 				return md, err
 			}
 		case cborTypeUnsigned:
-			if md, ok, err := decodeMapUint(b); ok || err != nil {
+			if md, ok, err := decodeMapUint(b, depth); ok || err != nil {
 				return md, err
 			}
-			if md, ok, err := decodeMapInt(b); ok || err != nil {
+			if md, ok, err := decodeMapInt(b, depth); ok || err != nil {
 				return md, err
 			}
-			if md, ok, err := decodeMapText(b); ok || err != nil {
+			if md, ok, err := decodeMapText(b, depth); ok || err != nil {
 				return md, err
 			}
-			if md, ok, err := decodeMapBytes(b); ok || err != nil {
+			if md, ok, err := decodeMapBytes(b, depth); ok || err != nil {
 				return md, err
 			}
 		case cborTypeNegative:
-			if md, ok, err := decodeMapInt(b); ok || err != nil {
+			if md, ok, err := decodeMapInt(b, depth); ok || err != nil {
 				return md, err
 			}
-			if md, ok, err := decodeMapUint(b); ok || err != nil {
+			if md, ok, err := decodeMapUint(b, depth); ok || err != nil {
 				return md, err
 			}
-			if md, ok, err := decodeMapText(b); ok || err != nil {
+			if md, ok, err := decodeMapText(b, depth); ok || err != nil {
 				return md, err
 			}
-			if md, ok, err := decodeMapBytes(b); ok || err != nil {
+			if md, ok, err := decodeMapBytes(b, depth); ok || err != nil {
 				return md, err
 			}
 		case cborTypeByteString:
-			if md, ok, err := decodeMapBytes(b); ok || err != nil {
+			if md, ok, err := decodeMapBytes(b, depth); ok || err != nil {
 				return md, err
 			}
-			if md, ok, err := decodeMapUint(b); ok || err != nil {
+			if md, ok, err := decodeMapUint(b, depth); ok || err != nil {
 				return md, err
 			}
-			if md, ok, err := decodeMapInt(b); ok || err != nil {
+			if md, ok, err := decodeMapInt(b, depth); ok || err != nil {
 				return md, err
 			}
-			if md, ok, err := decodeMapText(b); ok || err != nil {
+			if md, ok, err := decodeMapText(b, depth); ok || err != nil {
 				return md, err
 			}
 		default:
-			if md, ok, err := decodeMapUint(b); ok || err != nil {
+			if md, ok, err := decodeMapUint(b, depth); ok || err != nil {
 				return md, err
 			}
-			if md, ok, err := decodeMapInt(b); ok || err != nil {
+			if md, ok, err := decodeMapInt(b, depth); ok || err != nil {
 				return md, err
 			}
-			if md, ok, err := decodeMapText(b); ok || err != nil {
+			if md, ok, err := decodeMapText(b, depth); ok || err != nil {
 				return md, err
 			}
-			if md, ok, err := decodeMapBytes(b); ok || err != nil {
+			if md, ok, err := decodeMapBytes(b, depth); ok || err != nil {
 				return md, err
 			}
 		}
-		if md, ok, err := decodeMapGeneric(b); ok || err != nil {
+		if md, ok, err := decodeMapGeneric(b, depth); ok || err != nil {
 			return md, err
 		}
 		return nil, errors.New("failed to decode CBOR map in metadatum")
@@ -421,14 +445,14 @@ func decodeCBORItemEnd(b []byte, offset int) (int, bool) {
 	}
 }
 
-func decodeMapUint(b []byte) (TransactionMetadatum, bool, error) {
+func decodeMapUint(b []byte, depth int) (TransactionMetadatum, bool, error) {
 	var m map[uint]cbor.RawMessage
 	if _, err := cbor.Decode(b, &m); err != nil {
 		return nil, false, nil //nolint:nilerr // not this shape
 	}
 	pairs := make([]MetaPair, 0, len(m))
 	for k, rv := range m {
-		val, err := DecodeMetadatumRaw(rv)
+		val, err := decodeMetadatumRaw(rv, depth+1)
 		if err != nil {
 			return nil, true, fmt.Errorf("decode map(uint) value: %w", err)
 		}
@@ -536,14 +560,14 @@ func decodeCBORTextString(b []byte, offset int) (string, int, bool) {
 	return string(b[offset : offset+length]), offset + length, true
 }
 
-func decodeMapInt(b []byte) (TransactionMetadatum, bool, error) {
+func decodeMapInt(b []byte, depth int) (TransactionMetadatum, bool, error) {
 	var m map[int]cbor.RawMessage
 	if _, err := cbor.Decode(b, &m); err != nil {
 		return nil, false, nil //nolint:nilerr // not this shape
 	}
 	pairs := make([]MetaPair, 0, len(m))
 	for k, rv := range m {
-		val, err := DecodeMetadatumRaw(rv)
+		val, err := decodeMetadatumRaw(rv, depth+1)
 		if err != nil {
 			return nil, true, fmt.Errorf("decode map(int) value: %w", err)
 		}
@@ -560,14 +584,14 @@ func decodeMapInt(b []byte) (TransactionMetadatum, bool, error) {
 	return mm, true, nil
 }
 
-func decodeMapText(b []byte) (TransactionMetadatum, bool, error) {
+func decodeMapText(b []byte, depth int) (TransactionMetadatum, bool, error) {
 	var m map[string]cbor.RawMessage
 	if _, err := cbor.Decode(b, &m); err != nil {
 		return nil, false, nil //nolint:nilerr // not this shape
 	}
 	pairs := make([]MetaPair, 0, len(m))
 	for k, rv := range m {
-		val, err := DecodeMetadatumRaw(rv)
+		val, err := decodeMetadatumRaw(rv, depth+1)
 		if err != nil {
 			return nil, true, fmt.Errorf("decode map(text) value: %w", err)
 		}
@@ -578,14 +602,14 @@ func decodeMapText(b []byte) (TransactionMetadatum, bool, error) {
 	return mm, true, nil
 }
 
-func decodeMapBytes(b []byte) (TransactionMetadatum, bool, error) {
+func decodeMapBytes(b []byte, depth int) (TransactionMetadatum, bool, error) {
 	var m map[cbor.ByteString]cbor.RawMessage
 	if _, err := cbor.Decode(b, &m); err != nil {
 		return nil, false, nil //nolint:nilerr // not this shape
 	}
 	pairs := make([]MetaPair, 0, len(m))
 	for k, rv := range m {
-		val, err := DecodeMetadatumRaw(rv)
+		val, err := decodeMetadatumRaw(rv, depth+1)
 		if err != nil {
 			return nil, true, fmt.Errorf("decode map(bytes) value: %w", err)
 		}
@@ -601,7 +625,7 @@ func decodeMapBytes(b []byte) (TransactionMetadatum, bool, error) {
 	return mm, true, nil
 }
 
-func decodeMapGeneric(b []byte) (TransactionMetadatum, bool, error) {
+func decodeMapGeneric(b []byte, depth int) (TransactionMetadatum, bool, error) {
 	// Use *cbor.Value for keys to handle any CBOR type, including types
 	// that are not comparable in Go (maps, arrays) which cannot be used
 	// as keys in map[any]. Pointer keys are always comparable.
@@ -614,11 +638,11 @@ func decodeMapGeneric(b []byte) (TransactionMetadatum, bool, error) {
 		if k == nil {
 			return nil, true, errors.New("decode map key: unsupported nil CBOR value")
 		}
-		keyMd, err := DecodeMetadatumRaw(k.Cbor())
+		keyMd, err := decodeMetadatumRaw(k.Cbor(), depth+1)
 		if err != nil {
 			return nil, true, fmt.Errorf("decode map key: %w", err)
 		}
-		val, err := DecodeMetadatumRaw(rv)
+		val, err := decodeMetadatumRaw(rv, depth+1)
 		if err != nil {
 			return nil, true, fmt.Errorf("decode map(generic) value: %w", err)
 		}
@@ -703,6 +727,13 @@ func (s *TransactionMetadataSet) UnmarshalCBOR(cborData []byte) error {
 		}
 		md, err := DecodeAuxiliaryDataToMetadata(raw)
 		if err != nil {
+			// A metadatum past MaxMetadatumDepth is the one shape the
+			// node accepts that this decoder refuses. Keep its raw bytes
+			// (GetRawMetadata) and leave the parsed form absent, so one
+			// such transaction cannot make the whole block undecodable.
+			if errors.Is(err, ErrMetadatumTooDeep) {
+				continue
+			}
 			return fmt.Errorf(
 				"failed to decode metadata for key %d: %w",
 				k,
